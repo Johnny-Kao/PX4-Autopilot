@@ -35,33 +35,57 @@ assert start_ack is not None and start_ack.seq == 0, (
 )
 print("A started upload and stalled before item 0", flush=True)
 
-# B is an unrelated component on the same MAVLink transport. It keeps
-# submitting MISSION_COUNT, and PX4 is supposed to reject every one.
-# Crucially, these rejected messages must NOT refresh A's timeout.
+# B is an unrelated sender on the same MAVLink transport. Before A's
+# timeout, B must be rejected. After A's timeout, B is allowed to become
+# the new uploader; this admission is evidence of recovery, not a failure.
 start = time.monotonic()
 rejections = 0
-while time.monotonic() - start < 6.5:
+b_admitted = False
+while time.monotonic() - start < 6.5 and not b_admitted:
     send_count(202, 1)
     deadline = time.monotonic() + .20
     while time.monotonic() < deadline:
         m = link.recv_match(blocking=True, timeout=.03)
-        if (m and m.get_type() == "MISSION_ACK"
-                and getattr(m, "target_system", None) == 202):
-            if m.type == mavutil.mavlink.MAV_MISSION_ERROR:
-                rejections += 1
-            else:
-                raise AssertionError(f"B was unexpectedly accepted: {m}")
-assert rejections >= 1, "No rejection of foreign MISSION_COUNT observed"
-print(f"B requests rejected {rejections} times over 6.5 seconds", flush=True)
+        if m is None or getattr(m, "target_system", None) != 202:
+            continue
+        if m.get_type() == "MISSION_ACK":
+            assert m.type == mavutil.mavlink.MAV_MISSION_ERROR, (
+                f"Unexpected response to B: {m}"
+            )
+            rejections += 1
+        elif m.get_type() in ("MISSION_REQUEST_INT", "MISSION_REQUEST"):
+            assert m.seq == 0, f"Unexpected request to B: {m}"
+            b_admitted = True
+            break
 
-# C should be allowed to begin a new mission upload after A's 5-second
-# protocol timeout; under the original code, B has kept A alive.
+assert rejections >= 1, "No rejection of foreign MISSION_COUNT observed"
+elapsed = time.monotonic() - start
+print(f"B rejected {rejections} times; newly admitted={b_admitted} after {elapsed:.2f}s",
+      flush=True)
+assert b_admitted == EXPECTED, (
+    f"Unexpected B admission, expected={EXPECTED}, observed={b_admitted}"
+)
+
+if b_admitted:
+    # The formerly unrelated B is now the active partner. It must cancel its
+    # newly accepted transfer before C can start; otherwise rejecting C is valid.
+    link.mav.srcSystem = 202
+    link.mav.srcComponent = 191
+    link.mav.mission_ack_send(
+        target_system, target_component,
+        mavutil.mavlink.MAV_MISSION_OPERATION_CANCELLED, mission_type=0
+    )
+    time.sleep(.3)
+
+# C must start immediately after B cancels (patched), whereas on the original
+# code A still owns the transfer because rejected B packets reset its timeout.
 send_count(203, 1)
 response = receive_for(203, 3, {"MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"})
-assert response is not None, "No response to C's new mission upload"
-recovered = response.get_type() in ("MISSION_REQUEST_INT", "MISSION_REQUEST") and response.seq == 0
-print(f"C response={response}; recovered={recovered}; expected={EXPECTED}", flush=True)
-assert recovered == EXPECTED, (
-    f"Regression mismatch, expected recovery={EXPECTED} but got {response}"
+assert response is not None, "No response to C's mission upload"
+c_admitted = response.get_type() in ("MISSION_REQUEST_INT", "MISSION_REQUEST") and response.seq == 0
+print(f"C response={response}; admitted={c_admitted}; expected={EXPECTED}", flush=True)
+assert c_admitted == EXPECTED, (
+    f"Regression mismatch, expected C admission={EXPECTED} but got {response}"
 )
-print("PASS: baseline reproduces bug" if not EXPECTED else "PASS: patch restores timeout", flush=True)
+print("PASS: baseline keeps transaction busy" if not EXPECTED else
+      "PASS: patch releases timed-out transaction and permits new upload", flush=True)
