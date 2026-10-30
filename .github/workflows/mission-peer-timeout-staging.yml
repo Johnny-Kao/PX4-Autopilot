@@ -1,0 +1,64 @@
+name: Mission upload peer timeout regression (staging)
+on:
+  push:
+    branches:
+      - staging/mission-count-peer-timeout
+    paths:
+      - 'src/modules/mavlink/mavlink_mission.cpp'
+      - 'test/mission_count_peer_timeout_repro.py'
+      - '.github/workflows/mission-peer-timeout-staging.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  protocol-replay:
+    name: SITL / ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/px4/px4-dev:v1.17.0-rc2
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, patched]
+    env:
+      PX4_SBOM_DISABLE: '1'
+      PIP_BREAK_SYSTEM_PACKAGES: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+      - name: Configure Git safe directory
+        run: git config --global --add safe.directory '*'
+      - name: Restore upstream-equivalent file for baseline
+        if: matrix.variant == 'baseline'
+        run: |
+          git fetch origin main --depth=1
+          git checkout origin/main -- src/modules/mavlink/mavlink_mission.cpp
+      - name: Compile PX4 SITL
+        run: make px4_sitl_default
+      - name: Install MAVLink protocol replay dependency
+        run: python3 -m pip install --break-system-packages pymavlink
+      - name: Replay two ground stations without arming or flight
+        shell: bash
+        env:
+          EXPECT_RECOVERY: ${{ matrix.variant == 'patched' && 'yes' || 'no' }}
+        run: |
+          set -euo pipefail
+          export NO_PXH=1
+          timeout 120s make px4_sitl_default none > /tmp/px4-protocol.log 2>&1 &
+          px4_pid=$!
+          trap 'kill "$px4_pid" 2>/dev/null || true' EXIT
+          sleep 4
+          python3 -u test/mission_count_peer_timeout_repro.py
+          printf '\nPX4 console diagnostics:\n'
+          grep -E 'Mission sync timeout|Request from another partner|REJ. WP CMD|WPM:|WARN' /tmp/px4-protocol.log || true
+      - name: Upload PX4 console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mission-peer-timeout-${{ matrix.variant }}
+          path: /tmp/px4-protocol.log
